@@ -4,7 +4,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional
 import numpy as np
 import pandas as pd
 import joblib
@@ -19,14 +19,13 @@ app = FastAPI(title="Agrivoltaic Calculator API", description="API для рас
 # Настройка CORS для работы с Tilda
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене замените на ваш домен Tilda
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ========== КЛАССЫ ИЗ ВАШЕГО NOTEBOOK ==========
-
+# ========== КЛАСС ДЛЯ ПОЛУЧЕНИЯ РАДИАЦИИ ==========
 class WeatherFetcher:
     def get_radiation(self, lat, lon):
         try:
@@ -44,6 +43,7 @@ class WeatherFetcher:
         rad = 1500 - abs(lat) * 8
         return round(max(800, min(2200, rad)), 0)
 
+# ========== КЛАСС ДЛЯ РАСЧЕТА ЭНЕРГИИ ==========
 class Calculator:
     def __init__(self):
         self.panel_width = 2.134
@@ -112,7 +112,6 @@ class Calculator:
         }
 
 # ========== ЗАГРУЗКА МОДЕЛЕЙ ==========
-
 class ModelPredictor:
     def __init__(self):
         self.models = {}
@@ -131,13 +130,12 @@ class ModelPredictor:
                 try:
                     self.models[sector] = joblib.load(model_path)
                     self.scalers[sector] = joblib.load(scaler_path)
-                    print(f"✅ Загружена модель {sector}")
+                    print(f"Загружена модель {sector}")
                 except Exception as e:
-                    print(f"⚠ Ошибка загрузки {sector}: {e}")
+                    print(f"Ошибка загрузки {sector}: {e}")
     
     def predict(self, sector, features):
         if sector not in self.models:
-            # Fallback предсказания
             fallbacks = {'crop': 85, 'aqua': 8, 'forest': 12}
             return fallbacks.get(sector, 50) + np.random.normal(0, 5)
         
@@ -146,9 +144,8 @@ class ModelPredictor:
         return float(self.models[sector].predict(X_scaled)[0])
 
 # ========== PYDANTIC МОДЕЛИ ДЛЯ ЗАПРОСОВ ==========
-
 class CalculationRequest(BaseModel):
-    sector: str  # crop, aqua, forest
+    sector: str
     lat: float
     lon: float
     area_ha: float
@@ -157,30 +154,27 @@ class CalculationRequest(BaseModel):
     energy_price: float
     temp: float = 15.0
     
-    # Растениеводство
     crop_price: Optional[float] = 30
     base_yield: Optional[float] = 10000
     crop_name: Optional[str] = "Пшеница"
     
-    # Аквакультура
     fish_price: Optional[float] = 150
     stocking_density: Optional[float] = 10
     oxygen_level: Optional[float] = 7
     pond_depth: Optional[float] = 3
     fish_name: Optional[str] = "Карп"
     
-    # Лесное хозяйство
     wood_price: Optional[float] = 5000
     tree_height: Optional[float] = 15
     canopy_density: Optional[float] = 0.6
     forest_name: Optional[str] = "Сосна"
 
-# ========== API ENDPOINTS ==========
-
+# ========== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ==========
 weather_fetcher = WeatherFetcher()
 calculator = Calculator()
 predictor = ModelPredictor()
 
+# ========== API ENDPOINTS ==========
 @app.get("/")
 def root():
     return {
@@ -188,9 +182,9 @@ def root():
         "version": "1.0",
         "status": "running",
         "endpoints": {
-            "/calculate": "POST - Расчет агривольтаической системы",
-            "/radiation": "GET - Получение радиации по координатам",
-            "/health": "GET - Проверка состояния"
+            "/calculate": "POST - Расчет",
+            "/radiation": "GET - Радиация",
+            "/health": "GET - Проверка"
         }
     }
 
@@ -200,19 +194,14 @@ def health():
 
 @app.get("/radiation")
 def get_radiation(lat: float, lon: float):
-    """Получение солнечной радиации по координатам"""
     radiation = weather_fetcher.get_radiation(lat, lon)
     return {"radiation": radiation, "lat": lat, "lon": lon}
 
 @app.post("/calculate")
 def calculate(request: CalculationRequest):
-    """Основной расчет агривольтаической системы"""
-    
     try:
-        # Получаем радиацию
         radiation = weather_fetcher.get_radiation(request.lat, request.lon)
         
-        # Расчет энергии
         energy = calculator.solar_energy_pvsyst(
             request.area_ha, 
             request.coverage, 
@@ -220,10 +209,16 @@ def calculate(request: CalculationRequest):
             request.lat
         )
         
-        # Расчет в зависимости от сектора
+        # ========== РАСТЕНИЕВОДСТВО ==========
         if request.sector == "crop":
-            # Растениеводство
-            features = [request.lat, request.lon, 0.4, request.temp, 500]
+            features = [
+                request.lat,      # latitude
+                request.lon,      # longitude
+                0.5,              # shade_tolerance
+                20.0,             # optimal_temp
+                500.0,            # water_requirement
+                120.0             # growing_days
+            ]
             productivity_change = predictor.predict('crop', features)
             
             product_income = request.base_yield * request.area_ha * (productivity_change / 100) * request.crop_price
@@ -257,10 +252,17 @@ def calculate(request: CalculationRequest):
                     "total_income_rub": economics['total_income']
                 }
             }
-            
+        
+        # ========== АКВАКУЛЬТУРА ==========
         elif request.sector == "aqua":
-            # Аквакультура
-            features = [request.lat, request.lon, request.temp, request.oxygen_level, request.stocking_density, request.pond_depth]
+            features = [
+                request.lat,           # latitude
+                request.lon,           # longitude
+                request.temp,          # water_temp
+                request.oxygen_level,  # oxygen_level
+                request.stocking_density,  # stocking_density
+                request.pond_depth     # pond_depth
+            ]
             productivity = predictor.predict('aqua', features)
             
             product_income = productivity * request.area_ha * request.fish_price * 1000
@@ -294,10 +296,17 @@ def calculate(request: CalculationRequest):
                     "total_income_rub": economics['total_income']
                 }
             }
-            
-        else:  # forest
-            # Лесное хозяйство
-            features = [request.lat, request.lon, request.tree_height, request.canopy_density, 0.8]
+        
+        # ========== ЛЕСНОЕ ХОЗЯЙСТВО ==========
+        else:
+            features = [
+                request.lat,           # latitude
+                request.lon,           # longitude
+                request.tree_height,   # tree_height
+                request.canopy_density, # canopy_density
+                1.0,                   # growth_rate
+                0.6                    # wood_density
+            ]
             productivity = predictor.predict('forest', features)
             
             product_income = productivity * request.area_ha * request.wood_price
@@ -332,7 +341,6 @@ def calculate(request: CalculationRequest):
                 }
             }
         
-        # Добавляем общую информацию
         result["radiation"] = radiation
         result["location"] = {"lat": request.lat, "lon": request.lon}
         result["area_ha"] = request.area_ha
