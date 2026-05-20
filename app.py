@@ -12,7 +12,7 @@ import urllib.request
 import json
 from datetime import datetime
 
-app = FastAPI(title="Agrivoltaic Calculator API", version="2.0")
+app = FastAPI(title="Agrivoltaic Calculator API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,43 +24,63 @@ app.add_middleware(
 
 class WeatherFetcher:
     def get_radiation(self, lat, lon):
+        """Получение годовой радиации (кВт·ч/м²/год) из NASA POWER"""
         try:
             url = f"https://power.larc.nasa.gov/api/temporal/monthly/point?parameters=ALLSKY_SFC_SW_DWN&community=AG&longitude={lon}&latitude={lat}&start=2023&end=2024&format=JSON"
             req = urllib.request.Request(url)
             req.add_header('User-Agent', 'Mozilla/5.0')
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode())
-            rads = [v for v in data['properties']['parameter']['ALLSKY_SFC_SW_DWN'].values() if v != -999]
-            if rads:
-                annual = np.mean(rads) * 365
+            
+            # NASA возвращает среднесуточную радиацию (кВт·ч/м²/день)
+            daily_values = []
+            for month, value in data['properties']['parameter']['ALLSKY_SFC_SW_DWN'].items():
+                if value != -999:
+                    daily_values.append(value)
+            
+            if daily_values:
+                # Среднесуточная радиация за год
+                avg_daily = np.mean(daily_values)
+                # Годовая радиация = среднесуточная × 365
+                annual = avg_daily * 365
                 return round(annual, 0)
-        except:
-            pass
+        except Exception as e:
+            print(f"Ошибка получения радиации: {e}")
+        
+        # Fallback: эмпирическая формула
         rad = 1500 - abs(lat) * 8
         return round(max(800, min(2200, rad)), 0)
     
     def get_temperature(self, lat, lon):
+        """Получение среднегодовой температуры (°C)"""
         try:
             url = f"https://power.larc.nasa.gov/api/temporal/monthly/point?parameters=T2M&community=AG&longitude={lon}&latitude={lat}&start=2023&end=2024&format=JSON"
             req = urllib.request.Request(url)
             req.add_header('User-Agent', 'Mozilla/5.0')
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode())
-            temps = [v for v in data['properties']['parameter']['T2M'].values() if v != -999]
+            
+            temps = []
+            for month, value in data['properties']['parameter']['T2M'].items():
+                if value != -999:
+                    temps.append(value)
+            
             if temps:
                 annual = np.mean(temps)
                 return round(annual, 1)
-        except:
-            pass
+        except Exception as e:
+            print(f"Ошибка получения температуры: {e}")
+        
+        # Fallback: эмпирическая формула
         return 15.0
 
 class Calculator:
     def __init__(self):
         self.panel_width = 2.134
         self.panel_height = 1.051
-        self.panel_power = 0.445
+        self.panel_power = 0.445  # 445 Вт
         self.panel_area = self.panel_width * self.panel_height
-        self.panel_efficiency = 0.20
+        self.panel_efficiency = 0.20  # 20% КПД
         
     def solar_energy_pvsyst(self, area_ha, coverage, radiation, lat):
         area_m2 = area_ha * 10000
@@ -68,19 +88,26 @@ class Calculator:
         num_panels = int(panel_area_total / self.panel_area)
         total_power = num_panels * self.panel_power
         
+        # Оптимальный угол наклона
         tilt_optimal = abs(lat) * 0.9 + 5
         tilt_optimal = min(55, max(20, tilt_optimal))
         tilt_factor = np.cos(np.radians(tilt_optimal - abs(lat))) * 0.95 + 0.05
         
-        soiling_loss = 0.97
-        thermal_loss = 0.92
-        inverter_loss = 0.97
-        cable_loss = 0.98
-        mismatch_loss = 0.99
+        # Коэффициенты потерь
+        soiling_loss = 0.97      # загрязнение
+        thermal_loss = 0.92      # температурные потери
+        inverter_loss = 0.97     # инвертор
+        cable_loss = 0.98        # кабели
+        mismatch_loss = 0.99     # mismatch
         total_efficiency = soiling_loss * thermal_loss * inverter_loss * cable_loss * mismatch_loss
         
+        # Годовая выработка (кВт·ч)
         annual_energy = panel_area_total * radiation * total_efficiency * self.panel_efficiency * tilt_factor
+        
+        # Удельная выработка
         specific_yield = annual_energy / total_power if total_power > 0 else 0
+        
+        # Упрощенное помесячное распределение
         monthly_energy = [annual_energy / 12] * 12
         
         return {
@@ -137,6 +164,7 @@ class ModelPredictor:
         X_scaled = self.scalers[sector].transform(X)
         return float(self.models[sector].predict(X_scaled)[0])
 
+# Инициализация
 weather_fetcher = WeatherFetcher()
 calculator = Calculator()
 predictor = ModelPredictor()
@@ -150,14 +178,17 @@ class CalculationRequest(BaseModel):
     height: float
     energy_price: float
     temp: Optional[float] = None
+    
     crop_price: Optional[float] = 30
     base_yield: Optional[float] = 10000
     crop_name: Optional[str] = "Пшеница"
+    
     fish_price: Optional[float] = 150
     stocking_density: Optional[float] = 10
     oxygen_level: Optional[float] = 7
     pond_depth: Optional[float] = 3
     fish_name: Optional[str] = "Карп"
+    
     wood_price: Optional[float] = 5000
     tree_height: Optional[float] = 15
     canopy_density: Optional[float] = 0.6
@@ -165,7 +196,7 @@ class CalculationRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": "Agrivoltaic Calculator API", "version": "2.0", "status": "running"}
+    return {"service": "Agrivoltaic Calculator API", "version": "2.1", "status": "running"}
 
 @app.get("/health")
 def health():
