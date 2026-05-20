@@ -12,7 +12,7 @@ import urllib.request
 import json
 from datetime import datetime
 
-app = FastAPI(title="Agrivoltaic Calculator API", version="2.1")
+app = FastAPI(title="Agrivoltaic Calculator API", version="2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,11 @@ app.add_middleware(
 
 class WeatherFetcher:
     def get_radiation(self, lat, lon):
-        """Получение годовой радиации (кВт·ч/м²/год) из NASA POWER"""
+        """
+        Получение годовой солнечной радиации (кВт·ч/м²/год)
+        NASA POWER возвращает значения в МДж/м²/день
+        Переводим в кВт·ч/м²/год
+        """
         try:
             url = f"https://power.larc.nasa.gov/api/temporal/monthly/point?parameters=ALLSKY_SFC_SW_DWN&community=AG&longitude={lon}&latitude={lat}&start=2023&end=2024&format=JSON"
             req = urllib.request.Request(url)
@@ -32,27 +36,35 @@ class WeatherFetcher:
             with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode())
             
-            # NASA возвращает среднесуточную радиацию (кВт·ч/м²/день)
-            daily_values = []
+            # Собираем значения за каждый месяц
+            monthly_values = []
             for month, value in data['properties']['parameter']['ALLSKY_SFC_SW_DWN'].items():
-                if value != -999:
-                    daily_values.append(value)
+                if value != -999 and value is not None:
+                    monthly_values.append(float(value))
             
-            if daily_values:
-                # Среднесуточная радиация за год
-                avg_daily = np.mean(daily_values)
-                # Годовая радиация = среднесуточная × 365
-                annual = avg_daily * 365
-                return round(annual, 0)
+            if monthly_values:
+                # NASA возвращает МДж/м²/день
+                avg_mj_per_day = np.mean(monthly_values)
+                
+                # Переводим в кВт·ч/м²/день (1 кВт·ч = 3.6 МДж)
+                avg_kwh_per_day = avg_mj_per_day / 3.6
+                
+                # Годовая радиация (кВт·ч/м²/год)
+                annual_kwh_per_m2 = avg_kwh_per_day * 365
+                
+                # Проверка на реалистичность
+                if 800 <= annual_kwh_per_m2 <= 2200:
+                    return round(annual_kwh_per_m2, 0)
+                    
         except Exception as e:
             print(f"Ошибка получения радиации: {e}")
         
-        # Fallback: эмпирическая формула
+        # Fallback: эмпирическая формула по широте
         rad = 1500 - abs(lat) * 8
         return round(max(800, min(2200, rad)), 0)
     
     def get_temperature(self, lat, lon):
-        """Получение среднегодовой температуры (°C)"""
+        """Получение среднегодовой температуры воздуха (°C)"""
         try:
             url = f"https://power.larc.nasa.gov/api/temporal/monthly/point?parameters=T2M&community=AG&longitude={lon}&latitude={lat}&start=2023&end=2024&format=JSON"
             req = urllib.request.Request(url)
@@ -60,33 +72,38 @@ class WeatherFetcher:
             with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode())
             
-            temps = []
+            temperatures = []
             for month, value in data['properties']['parameter']['T2M'].items():
-                if value != -999:
-                    temps.append(value)
+                if value != -999 and value is not None:
+                    temperatures.append(float(value))
             
-            if temps:
-                annual = np.mean(temps)
+            if temperatures:
+                annual = np.mean(temperatures)
                 return round(annual, 1)
+                
         except Exception as e:
             print(f"Ошибка получения температуры: {e}")
         
-        # Fallback: эмпирическая формула
+        # Fallback
         return 15.0
 
 class Calculator:
     def __init__(self):
-        self.panel_width = 2.134
-        self.panel_height = 1.051
-        self.panel_power = 0.445  # 445 Вт
-        self.panel_area = self.panel_width * self.panel_height
-        self.panel_efficiency = 0.20  # 20% КПД
+        self.panel_width = 2.134      # метра
+        self.panel_height = 1.051      # метра
+        self.panel_power = 0.445       # 445 Вт
+        self.panel_area = self.panel_width * self.panel_height  # 2.24 м²
+        self.panel_efficiency = 0.20   # 20% КПД
         
     def solar_energy_pvsyst(self, area_ha, coverage, radiation, lat):
+        """
+        Расчет по методике PVsyst
+        radiation: годовая радиация (кВт·ч/м²/год)
+        """
         area_m2 = area_ha * 10000
         panel_area_total = area_m2 * coverage
         num_panels = int(panel_area_total / self.panel_area)
-        total_power = num_panels * self.panel_power
+        total_power = num_panels * self.panel_power  # кВт
         
         # Оптимальный угол наклона
         tilt_optimal = abs(lat) * 0.9 + 5
@@ -94,20 +111,20 @@ class Calculator:
         tilt_factor = np.cos(np.radians(tilt_optimal - abs(lat))) * 0.95 + 0.05
         
         # Коэффициенты потерь
-        soiling_loss = 0.97      # загрязнение
-        thermal_loss = 0.92      # температурные потери
-        inverter_loss = 0.97     # инвертор
-        cable_loss = 0.98        # кабели
-        mismatch_loss = 0.99     # mismatch
-        total_efficiency = soiling_loss * thermal_loss * inverter_loss * cable_loss * mismatch_loss
+        soiling_loss = 0.97      # загрязнение (3%)
+        thermal_loss = 0.92      # температурные потери (8%)
+        inverter_loss = 0.97     # инвертор (3%)
+        cable_loss = 0.98        # кабели (2%)
+        mismatch_loss = 0.99     # mismatch (1%)
+        total_efficiency = soiling_loss * thermal_loss * inverter_loss * cable_loss * mismatch_loss  # ~0.84
         
         # Годовая выработка (кВт·ч)
         annual_energy = panel_area_total * radiation * total_efficiency * self.panel_efficiency * tilt_factor
         
-        # Удельная выработка
+        # Удельная выработка (кВт·ч/кВт·год)
         specific_yield = annual_energy / total_power if total_power > 0 else 0
         
-        # Упрощенное помесячное распределение
+        # Помесячное распределение (упрощённо)
         monthly_energy = [annual_energy / 12] * 12
         
         return {
@@ -121,10 +138,11 @@ class Calculator:
         }
     
     def economics(self, energy, product_income, energy_price, capex_per_kw=60000):
+        """Экономический расчёт"""
         energy_income = energy['annual_energy'] * energy_price
         total_income = energy_income + product_income
         capex = energy['total_power'] * capex_per_kw
-        opex = capex * 0.015
+        opex = capex * 0.015  # 1.5% от CAPEX ежегодно
         net_income = total_income - opex
         roi = capex / net_income if net_income > 0 else 999
         return {
@@ -164,11 +182,12 @@ class ModelPredictor:
         X_scaled = self.scalers[sector].transform(X)
         return float(self.models[sector].predict(X_scaled)[0])
 
-# Инициализация
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 weather_fetcher = WeatherFetcher()
 calculator = Calculator()
 predictor = ModelPredictor()
 
+# ========== PYDANTIC МОДЕЛИ ДЛЯ ЗАПРОСОВ ==========
 class CalculationRequest(BaseModel):
     sector: str
     lat: float
@@ -179,24 +198,28 @@ class CalculationRequest(BaseModel):
     energy_price: float
     temp: Optional[float] = None
     
+    # Растениеводство
     crop_price: Optional[float] = 30
     base_yield: Optional[float] = 10000
     crop_name: Optional[str] = "Пшеница"
     
+    # Аквакультура
     fish_price: Optional[float] = 150
     stocking_density: Optional[float] = 10
     oxygen_level: Optional[float] = 7
     pond_depth: Optional[float] = 3
     fish_name: Optional[str] = "Карп"
     
+    # Лесное хозяйство
     wood_price: Optional[float] = 5000
     tree_height: Optional[float] = 15
     canopy_density: Optional[float] = 0.6
     forest_name: Optional[str] = "Сосна"
 
+# ========== API ENDPOINTS ==========
 @app.get("/")
 def root():
-    return {"service": "Agrivoltaic Calculator API", "version": "2.1", "status": "running"}
+    return {"service": "Agrivoltaic Calculator API", "version": "2.3", "status": "running"}
 
 @app.get("/health")
 def health():
@@ -210,14 +233,17 @@ def get_radiation(lat: float, lon: float):
 @app.post("/calculate")
 def calculate(request: CalculationRequest):
     try:
+        # Получаем данные из NASA
         radiation = weather_fetcher.get_radiation(request.lat, request.lon)
         auto_temp = weather_fetcher.get_temperature(request.lat, request.lon)
         temp = request.temp if request.temp is not None else auto_temp
         
+        # Расчёт энергии
         energy = calculator.solar_energy_pvsyst(
             request.area_ha, request.coverage, radiation, request.lat
         )
         
+        # ========== РАСТЕНИЕВОДСТВО ==========
         if request.sector == "crop":
             features = [request.lat, request.lon, 0.5, temp, 500.0, 120.0]
             productivity_change = predictor.predict('crop', features)
@@ -225,12 +251,17 @@ def calculate(request: CalculationRequest):
             base_income = request.base_yield * request.area_ha * request.crop_price
             economics = calculator.economics(energy, product_income, request.energy_price)
             result = {
-                "sector": "crop", "sector_name": "Растениеводство", "culture": request.crop_name,
-                "temperature_used": temp, "temperature_source": "NASA POWER" if request.temp is None else "user",
+                "sector": "crop",
+                "sector_name": "Растениеводство",
+                "culture": request.crop_name,
+                "temperature_used": temp,
+                "temperature_source": "NASA POWER" if request.temp is None else "user",
                 "productivity": {"value": productivity_change, "unit": "%", "label": "изменение урожайности"},
-                "energy": energy, "economics": economics
+                "energy": energy,
+                "economics": economics
             }
         
+        # ========== АКВАКУЛЬТУРА ==========
         elif request.sector == "aqua":
             features = [request.lat, request.lon, temp, request.oxygen_level, request.stocking_density, request.pond_depth]
             productivity = predictor.predict('aqua', features)
@@ -238,12 +269,17 @@ def calculate(request: CalculationRequest):
             base_income = request.stocking_density * request.area_ha * request.fish_price * 1000
             economics = calculator.economics(energy, product_income, request.energy_price, capex_per_kw=70000)
             result = {
-                "sector": "aqua", "sector_name": "Аквакультура", "culture": request.fish_name,
-                "temperature_used": temp, "temperature_source": "NASA POWER" if request.temp is None else "user",
+                "sector": "aqua",
+                "sector_name": "Аквакультура",
+                "culture": request.fish_name,
+                "temperature_used": temp,
+                "temperature_source": "NASA POWER" if request.temp is None else "user",
                 "productivity": {"value": productivity, "unit": "т/га", "label": "продуктивность"},
-                "energy": energy, "economics": economics
+                "energy": energy,
+                "economics": economics
             }
         
+        # ========== ЛЕСНОЕ ХОЗЯЙСТВО ==========
         else:
             features = [request.lat, request.lon, request.tree_height, request.canopy_density, 1.0, 0.6]
             productivity = predictor.predict('forest', features)
@@ -251,12 +287,17 @@ def calculate(request: CalculationRequest):
             base_income = 8 * request.area_ha * request.wood_price
             economics = calculator.economics(energy, product_income, request.energy_price)
             result = {
-                "sector": "forest", "sector_name": "Лесное хозяйство", "culture": request.forest_name,
-                "temperature_used": temp, "temperature_source": "NASA POWER" if request.temp is None else "user",
+                "sector": "forest",
+                "sector_name": "Лесное хозяйство",
+                "culture": request.forest_name,
+                "temperature_used": temp,
+                "temperature_source": "NASA POWER" if request.temp is None else "user",
                 "productivity": {"value": productivity, "unit": "м³/га/год", "label": "прирост древесины"},
-                "energy": energy, "economics": economics
+                "energy": energy,
+                "economics": economics
             }
         
+        # Общая информация
         result["radiation"] = radiation
         result["location"] = {"lat": request.lat, "lon": request.lon}
         result["area_ha"] = request.area_ha
